@@ -59,6 +59,8 @@ python3 claude-instruct.py status --scope project --project-dir /path/to/repo
 
 python3 claude-instruct.py install --scope user --runtime --yes
 
+source ~/.zshrc
+
 ```
 
 可选 user-scope runtime：先 `install --scope user --runtime` 预览，再加 `--yes`。macOS / Linux 随后 `source ~/.zshrc`；Windows PowerShell 用 `python .\\claude-instruct.py` 并 `. $PROFILE`。
