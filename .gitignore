@@ -7,3 +7,5 @@ htmlcov/
 .venv/
 .venv-build/
 .env
+
+.idea

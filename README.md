@@ -54,6 +54,11 @@ python3 claude-instruct.py --version  # claude-keysmith v7.1
 python3 claude-instruct.py install --scope project --project-dir /path/to/repo
 python3 claude-instruct.py install --scope project --project-dir /path/to/repo --yes
 python3 claude-instruct.py status --scope project --project-dir /path/to/repo
+
+
+
+python3 claude-instruct.py install --scope user --runtime --yes
+
 ```
 
 可选 user-scope runtime：先 `install --scope user --runtime` 预览，再加 `--yes`。macOS / Linux 随后 `source ~/.zshrc`；Windows PowerShell 用 `python .\\claude-instruct.py` 并 `. $PROFILE`。
