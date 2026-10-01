@@ -9,6 +9,8 @@ Layers:
        - ~/.claude/keysmith/append-prompt.md
        - settings.json systemPrompt alignment
        - shell wrapper that passes --system-prompt-file + --append-system-prompt-file
+  3. Optional --agents carrier: a keysmith-owned .claude/agents/keysmith.md
+     (user scope: ~/.claude/agents/keysmith.md) for Task/custom-agent system prompts
 
 Safety defaults:
   - Preview-only unless --yes is provided.
@@ -16,6 +18,8 @@ Safety defaults:
     tokens, or running processes.
   - Runtime injection only touches keysmith-owned prompt files, settings.systemPrompt
     alignment, and a managed shell wrapper block.
+  - --agents only creates or rewrites a file that already carries keysmith markers;
+    sibling agent files stay untouched.
   - Backs up touched files before overwriting or removing them.
 """
 
@@ -51,8 +55,14 @@ def _resource_base() -> Path:
 
 DEFAULT_EXAMPLE = _resource_base() / "examples" / "claude-project-rules.md"
 DEFAULT_APPEND_EXAMPLE = _resource_base() / "examples" / "claude-append-prompt.md"
-VERSION = "v7.1"
+VERSION = "v7.2"
 ATOMIC_TEMP_MARKER = ".keysmith-tmp-"
+AGENT_TYPE = "keysmith"
+AGENT_FILENAME = "keysmith.md"
+AGENT_BLOCK_NAME = "keysmith-agent"
+AGENT_DESCRIPTION = (
+    "Delivers requested lab artifacts in this workspace: CTF, pentest fixtures, and creative writing."
+)
 
 SHELL_BEGIN = "# >>> claude-keysmith runtime >>>"
 SHELL_END = "# <<< claude-keysmith runtime <<<"
@@ -87,6 +97,14 @@ class ScopePaths:
 
     def import_target(self, md_filename: str) -> str:
         return f"@{self.import_prefix}/{md_filename}"
+
+    def agents_dir(self) -> Path:
+        if self.scope == "user":
+            return self.root / "agents"
+        return self.root / ".claude" / "agents"
+
+    def agents_file(self) -> Path:
+        return self.agents_dir() / AGENT_FILENAME
 
 
 def normalize_md_name(name: str) -> str:
@@ -278,6 +296,35 @@ def remove_import_block(content: str, name: str) -> Tuple[str, bool]:
     return updated, bool(count)
 
 
+def render_agent_file(instruction_content: str, append_content: str) -> str:
+    """Owned Claude Code agent definition: YAML frontmatter + marked body."""
+    body = strip_markdown_h1(instruction_content).rstrip()
+    extra = (append_content or "").strip()
+    if extra:
+        body = f"{body}\n\n{extra}"
+    block = "\n".join(
+        [
+            START_TEMPLATE.format(name=AGENT_BLOCK_NAME),
+            body,
+            END_TEMPLATE.format(name=AGENT_BLOCK_NAME),
+        ]
+    )
+    return (
+        "---\n"
+        f"name: {AGENT_TYPE}\n"
+        f'description: "{AGENT_DESCRIPTION}"\n'
+        "---\n\n"
+        f"{ensure_trailing_newline(block)}"
+    )
+
+
+def keysmith_owns_agent_file(content: str) -> bool:
+    """True only when the file is a keysmith agent with matching markers."""
+    if not has_import_block(content, AGENT_BLOCK_NAME):
+        return False
+    return bool(re.search(r"(?m)^name:\s*keysmith\s*$", content or ""))
+
+
 def resolve_home() -> Path:
     """Resolve home dir: $CLAUDE_KEYSMITH_HOME > $HOME > Path.home().
 
@@ -304,49 +351,6 @@ def runtime_shell_kind() -> str:
     return "powershell" if os.name == "nt" else "zsh"
 
 
-def powershell_profile_path(home: Path) -> Path:
-    """Locate PowerShell profile for PS5 (WindowsPowerShell) or PS7 (PowerShell).
-
-    Override with $CLAUDE_KEYSMITH_SHELL_RC.
-    """
-    configured = os.environ.get("CLAUDE_KEYSMITH_SHELL_RC")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    module_path = os.environ.get("PSModulePath", "")
-    if ";" in module_path:
-        entries = module_path.split(";")
-    elif os.pathsep == ":" and not re.match(r"^[A-Za-z]:[\\/]", module_path):
-        entries = module_path.split(os.pathsep)
-    else:
-        entries = [module_path]
-    for entry in (item.strip().strip('"') for item in entries):
-        if not entry:
-            continue
-        module_dir = Path(entry).expanduser()
-        # Fresh Windows installs can advertise the user module path before the
-        # directory has been created, so classify the path by structure.
-        if module_dir.name.lower() != "modules":
-            continue
-        shell_dir = module_dir.parent
-        if shell_dir.name.lower() not in {"windowspowershell", "powershell"}:
-            continue
-        lowered_parts = {part.lower() for part in module_dir.parts}
-        if lowered_parts.intersection({"program files", "program files (x86)", "system32"}):
-            continue
-        try:
-            module_dir.resolve().relative_to(home.expanduser().resolve())
-            user_level = True
-        except ValueError:
-            user_level = "documents" in lowered_parts
-        if not user_level:
-            continue
-        return shell_dir / "Microsoft.PowerShell_profile.ps1"
-    raise ValueError(
-        "无法从 PSModulePath 判断 PowerShell 5.1/7 profile；"
-        "请设置 CLAUDE_KEYSMITH_SHELL_RC 为目标 profile 的完整路径"
-    )
-
-
 def _env_case_insensitive(name: str) -> Optional[str]:
     """Read an environment variable with Windows-compatible case matching."""
     direct = os.environ.get(name)
@@ -357,6 +361,221 @@ def _env_case_insensitive(name: str) -> Optional[str]:
         if key.lower() == lowered:
             return value
     return None
+
+
+_POWERSHELL_PROFILE_NAME = "Microsoft.PowerShell_profile.ps1"
+_POWERSHELL_PROFILE_DIRS = ("WindowsPowerShell", "PowerShell")
+_DOCUMENTS_DIR_NAMES = ("Documents", "文档")
+_SYSTEM_MODULE_MARKERS = {"program files", "program files (x86)", "system32"}
+
+
+def _windows_documents_from_known_folder() -> Optional[Path]:
+    """Resolve the current user's Documents folder via SHGetKnownFolderPath."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import uuid as uuid_mod
+    except ImportError:
+        return None
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    folder_id = uuid_mod.UUID("{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")
+    guid = GUID(
+        folder_id.time_low,
+        folder_id.time_mid,
+        folder_id.time_hi_version,
+        (ctypes.c_ubyte * 8).from_buffer_copy(folder_id.bytes[8:]),
+    )
+    path_ptr = ctypes.c_wchar_p()
+    try:
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(path_ptr)
+        )
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+    if hr != 0 or not path_ptr.value:
+        return None
+    try:
+        return Path(path_ptr.value)
+    finally:
+        try:
+            ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+        except (AttributeError, OSError, ValueError, TypeError):
+            pass
+
+
+def _windows_documents_from_registry() -> Optional[Path]:
+    """Resolve Documents from the user shell-folder registry (OneDrive-aware)."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "Personal")
+    except OSError:
+        return None
+    expanded = os.path.expandvars(str(value)).strip().strip('"')
+    return Path(expanded) if expanded else None
+
+
+def _path_identity(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(Path(path).expanduser())))
+
+
+def _home_is_windows_user_profile(home: Path) -> bool:
+    """True when *home* is the real Windows user profile, not a test/override HOME.
+
+    Known Folder / registry Documents must not leak into an isolated
+    CLAUDE_KEYSMITH_HOME or $HOME fixture. Path.home() on Windows reads
+    USERPROFILE and ignores Unix $HOME, which is the GUI sidecar case.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        home_key = _path_identity(home)
+    except (OSError, ValueError, TypeError):
+        return False
+    candidates = []
+    userprofile = _env_case_insensitive("USERPROFILE")
+    if userprofile:
+        candidates.append(userprofile)
+    try:
+        candidates.append(str(Path.home()))
+    except (OSError, RuntimeError):
+        pass
+    for candidate in candidates:
+        try:
+            if _path_identity(Path(candidate)) == home_key:
+                return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
+def iter_user_documents_dirs(home: Path) -> List[Path]:
+    """Candidate Documents directories for the given keysmith home.
+
+    Machine Known Folder / shell-folder registry / USERPROFILE\\Documents are
+    only consulted when *home* is the real Windows user profile. Isolated test
+    homes and CLAUDE_KEYSMITH_HOME overrides stay inside that home.
+    """
+    ordered: List[Path] = []
+    seen = set()
+
+    def add(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        try:
+            key = _path_identity(path)
+        except (OSError, ValueError, TypeError):
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(Path(key))
+
+    if _home_is_windows_user_profile(home):
+        add(_windows_documents_from_known_folder())
+        add(_windows_documents_from_registry())
+        userprofile = _env_case_insensitive("USERPROFILE")
+        if userprofile:
+            for name in _DOCUMENTS_DIR_NAMES:
+                add(Path(userprofile) / name)
+    for name in _DOCUMENTS_DIR_NAMES:
+        add(home / name)
+    if not ordered:
+        add(home / "Documents")
+    return ordered
+
+
+def _split_ps_module_path(module_path: str) -> List[str]:
+    if not module_path.strip():
+        return []
+    if ";" in module_path:
+        entries = module_path.split(";")
+    elif os.pathsep == ":" and not re.match(r"^[A-Za-z]:[\\/]", module_path):
+        entries = module_path.split(os.pathsep)
+    else:
+        entries = [module_path]
+    cleaned: List[str] = []
+    for item in entries:
+        entry = item.strip().strip('"')
+        if entry:
+            cleaned.append(entry)
+    return cleaned
+
+
+def _profile_from_module_dir(module_dir: Path, home: Path) -> Optional[Path]:
+    """Return the CurrentUserCurrentHost profile for a user-level Modules path."""
+    if module_dir.name.lower() != "modules":
+        return None
+    shell_dir = module_dir.parent
+    if shell_dir.name.lower() not in {"windowspowershell", "powershell"}:
+        return None
+    lowered_parts = {part.lower() for part in module_dir.parts}
+    if lowered_parts.intersection(_SYSTEM_MODULE_MARKERS):
+        return None
+    try:
+        module_dir.expanduser().resolve().relative_to(home.expanduser().resolve())
+        user_level = True
+    except ValueError:
+        user_level = "documents" in lowered_parts or "文档" in module_dir.parts
+    if not user_level:
+        return None
+    return shell_dir / _POWERSHELL_PROFILE_NAME
+
+
+def _fallback_powershell_profile(home: Path) -> Path:
+    """Pick a user profile when PSModulePath has no recognizable user entry.
+
+    GUI / sidecar processes typically inherit no PowerShell engine environment,
+    so PSModulePath is empty or system-only. Prefer an already-created profile
+    file; otherwise target Windows PowerShell 5.1 under Documents, which is the
+    Win10 default host. $CLAUDE_KEYSMITH_SHELL_RC still overrides.
+    """
+    documents_dirs = iter_user_documents_dirs(home)
+    for docs in documents_dirs:
+        for shell_dir in _POWERSHELL_PROFILE_DIRS:
+            candidate = docs / shell_dir / _POWERSHELL_PROFILE_NAME
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+    return documents_dirs[0] / "WindowsPowerShell" / _POWERSHELL_PROFILE_NAME
+
+
+def powershell_profile_path(home: Path) -> Path:
+    """Locate PowerShell profile for PS5 (WindowsPowerShell) or PS7 (PowerShell).
+
+    Override with $CLAUDE_KEYSMITH_SHELL_RC. Prefer the first user-level
+    PSModulePath entry when the current process actually has one (console
+    PowerShell / pwsh). When PSModulePath is missing or only system paths —
+    the Desktop sidecar case — fall back to the user Documents profile.
+    """
+    configured = os.environ.get("CLAUDE_KEYSMITH_SHELL_RC")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    module_path = _env_case_insensitive("PSModulePath") or ""
+    for entry in _split_ps_module_path(module_path):
+        profile = _profile_from_module_dir(Path(entry).expanduser(), home)
+        if profile is not None:
+            return profile
+    return _fallback_powershell_profile(home)
 
 
 def _path_key(path: Path) -> str:
@@ -1780,7 +1999,7 @@ def load_journal(path: Path) -> Optional[Dict[str, Any]]:
 
 def _atomic_temp_directories(paths: ScopePaths) -> List[Path]:
     """Directories where scope-owned atomic writes can leave crash residue."""
-    directories = {paths.memory_file.parent, paths.keysmith_dir}
+    directories = {paths.memory_file.parent, paths.keysmith_dir, paths.agents_dir()}
     if paths.scope == "user":
         home = resolve_home()
         directories.add(home)
@@ -1893,6 +2112,7 @@ def enumerate_scope_backups(paths: ScopePaths, include_runtime: bool = True) -> 
 
     collect(paths.root, "memory")
     collect(paths.keysmith_dir, "instruction")
+    collect(paths.agents_dir(), "agents")
     if include_runtime and paths.scope == "user":
         rt = user_runtime_paths()
         collect(rt["keysmith_dir"], "runtime")
@@ -2138,9 +2358,22 @@ def command_install(args) -> int:
         runtime = bool(getattr(args, "runtime", False))
         if runtime and paths.scope != "user":
             raise ValueError("--runtime 仅支持 --scope user（需要写入 ~/.claude 与 shell wrapper）")
+        agents = bool(getattr(args, "agents", False))
         max_tokens = getattr(args, "max_tokens", None)
         if max_tokens is not None and max_tokens <= 0:
             raise ValueError("--max-tokens 必须是正整数（>0）")
+        agents_content = ""
+        agents_path = paths.agents_file()
+        if agents:
+            agents_content = render_agent_file(
+                instruction_content, load_append_content(getattr(args, "append_file", None))
+            )
+            if agents_path.exists():
+                existing_agent = read_text_if_exists(agents_path)
+                if existing_agent and not keysmith_owns_agent_file(existing_agent):
+                    raise ValueError(
+                        f"拒绝覆盖非 keysmith 拥有的 agent 文件: {agents_path}"
+                    )
     except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return _write_command_error(args, "install", str(exc))
 
@@ -2150,6 +2383,8 @@ def command_install(args) -> int:
         "instruction_file": str(paths.instruction_file(md_filename)),
         "import_target": paths.import_target(md_filename),
     }
+    if agents:
+        report["target"]["agents_file"] = str(agents_path)
     instruction_source = Path(args.file).expanduser().resolve() if args.file else DEFAULT_EXAMPLE
     report["source"] = source_descriptor(
         "external" if args.file else "bundled", instruction_source, instruction_content
@@ -2173,6 +2408,7 @@ def command_install(args) -> int:
         print(f"memory change: {'yes' if memory_changed else 'no'}")
         print(f"instruction bytes: {len(instruction_content.encode('utf-8'))}")
         print(f"runtime inject: {'yes' if runtime else 'no'}")
+        print(f"agents inject: {'yes' if agents else 'no'}")
 
     instruction_path = paths.instruction_file(md_filename)
     if not use_json:
@@ -2187,6 +2423,13 @@ def command_install(args) -> int:
     if instruction_path.exists():
         _add_action(report, "backup", instruction_path, "back up existing instruction file before overwrite")
     _add_action(report, "write", instruction_path, "write keysmith instruction file")
+    if agents:
+        if agents_path.exists():
+            _add_action(report, "backup", agents_path, "back up existing keysmith agent file before overwrite")
+        _add_action(report, "write", agents_path, "write keysmith-owned .claude/agents/keysmith.md")
+        if not use_json:
+            print(f"agents file: {agents_path}")
+            print(f"agents bytes: {len(agents_content.encode('utf-8'))}")
 
     runtime_plan: Optional[Dict[str, Any]] = None
     if runtime:
@@ -2289,6 +2532,7 @@ def command_install(args) -> int:
         for target, will_backup in [
             (paths.memory_file, paths.memory_file.exists()),
             (instruction_path, instruction_path.exists()),
+            (agents_path, agents and agents_path.exists()),
         ]:
             if will_backup:
                 _planned_backup(report, target)
@@ -2344,6 +2588,17 @@ def command_install(args) -> int:
         executed.append(("write", paths.memory_file, None))
         if not use_json:
             print(f"[写入] {paths.memory_file}")
+
+        if agents:
+            if agents_path.exists():
+                backup = tx_backup_step(journal, agents_path, timestamp)
+                _actual_backup(report, agents_path, backup)
+                if not use_json:
+                    print(f"[备份] {agents_path.name} → {backup.name}")
+            tx_write_step(journal, agents_path, agents_content)
+            executed.append(("write", agents_path, None))
+            if not use_json:
+                print(f"[写入] {agents_path}")
 
         if runtime_plan is not None:
             rt = runtime_plan["paths"]
@@ -2428,6 +2683,40 @@ def command_install(args) -> int:
     return 0
 
 
+def _unavailable_runtime_status(exc: BaseException) -> Dict[str, Any]:
+    """Runtime block used when the probe itself fails closed.
+
+    status --json must still emit a document so the GUI can show the real
+    reason instead of "CLI 未输出稳定 JSON".
+    """
+    message = str(exc)
+    return {
+        "supported": True,
+        "error": message,
+        "shell_kind": runtime_shell_kind(),
+        "system_prompt_file": "",
+        "append_prompt_file": "",
+        "settings_file": "",
+        "shell_rc": "",
+        "system_prompt_exists": False,
+        "append_prompt_exists": False,
+        "settings_system_prompt_aligned": False,
+        "shell_wrapper_present": False,
+        "shell_wrapper_managed": False,
+        "upstream_candidates": [],
+        "upstream_path": None,
+        "upstream_exists": False,
+        "shell_wrapper_current": False,
+        "legacy_launcher_detected": False,
+        "legacy_launcher_paths": [],
+        "legacy_launcher_conflict": False,
+        "legacy_launcher_conflict_paths": [],
+        "upgrade_required": True,
+        "runtime_ready": False,
+        "note": message,
+    }
+
+
 def collect_runtime_status(paths: ScopePaths, md_filename: str, planned: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Structured runtime status for user scope.
 
@@ -2509,6 +2798,32 @@ def collect_runtime_status(paths: ScopePaths, md_filename: str, planned: Optiona
     }
 
 
+def collect_competing_context(paths: ScopePaths, runtime_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Surfaces instruction slots that can override the managed wrapper/import."""
+    rules_dir = paths.root / "rules" if paths.scope == "user" else paths.root / ".claude" / "rules"
+    extra_rules: List[str] = []
+    if rules_dir.is_dir():
+        extra_rules = [item.name for item in sorted(rules_dir.glob("*.md")) if item.is_file()]
+    memory_md: List[str] = []
+    candidates = [paths.root / "MEMORY.md"]
+    if paths.scope != "user":
+        candidates.append(paths.root / ".claude" / "MEMORY.md")
+    for candidate in candidates:
+        if candidate.is_file():
+            memory_md.append(str(candidate))
+    upgrade: Optional[bool] = None
+    if isinstance(runtime_status, dict) and "upgrade_required" in runtime_status:
+        upgrade = bool(runtime_status.get("upgrade_required"))
+    return {
+        "wrapper_parent_only": True,
+        "builtin_explore_plan_omit_claudemd": True,
+        "agents_carrier": paths.agents_file().is_file(),
+        "extra_rules": extra_rules,
+        "project_memory_md": memory_md,
+        "host_upgrade_required": upgrade,
+    }
+
+
 def collect_status(scope: str, project_dir: Optional[str], name: str, runtime: bool = False) -> dict:
     md_filename = normalize_md_name(name)
     block_name = marker_name(md_filename)
@@ -2518,6 +2833,10 @@ def collect_status(scope: str, project_dir: Optional[str], name: str, runtime: b
     instruction_exists = instruction_path.is_file()
     content = read_text_if_exists(paths.memory_file)
     block_exists = has_import_block(content, block_name)
+    agents_path = paths.agents_file()
+    agents_exists = agents_path.is_file()
+    agents_content = read_text_if_exists(agents_path) if agents_exists else ""
+    agents_owned = keysmith_owns_agent_file(agents_content)
     status: Dict[str, Any] = {
         "schema": JSON_SCHEMA,
         "scope": paths.scope,
@@ -2528,6 +2847,9 @@ def collect_status(scope: str, project_dir: Optional[str], name: str, runtime: b
         "memory_file_exists": memory_exists,
         "instruction_file_exists": instruction_exists,
         "import_block_exists": block_exists,
+        "agents_file": str(agents_path),
+        "agents_file_exists": agents_exists,
+        "agents_block_exists": agents_owned,
         "installed": bool(block_exists and instruction_exists),
     }
 
@@ -2536,24 +2858,31 @@ def collect_status(scope: str, project_dir: Optional[str], name: str, runtime: b
         "memory_file": memory_exists,
         "instruction_file": instruction_exists,
         "import_block": block_exists,
+        "agents_file": agents_exists,
     }
     status["alignment"] = {
         "import_block_present": block_exists,
         "import_target": paths.import_target(md_filename),
+        "agents_block_present": agents_owned,
     }
     status["source_identity"] = {
         "kind": "deployed" if instruction_exists else "missing",
         "instruction_sha256": file_evidence(instruction_path)["sha256"] if instruction_exists else None,
         "instruction_size_bytes": instruction_path.stat().st_size if instruction_exists else None,
         "drift": None,
+        "agents_sha256": file_evidence(agents_path)["sha256"] if agents_exists else None,
     }
     status["recovery_state"] = inspect_recovery_state(paths)
+    status["competing_context"] = collect_competing_context(paths, None)
 
     if runtime:
         if paths.scope != "user":
             status["runtime"] = {"supported": False, "reason": "runtime status only for user scope"}
         else:
-            runtime_status = collect_runtime_status(paths, md_filename)
+            try:
+                runtime_status = collect_runtime_status(paths, md_filename)
+            except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+                runtime_status = _unavailable_runtime_status(exc)
             status["runtime"] = runtime_status
             status["presence"].update(
                 {
@@ -2593,14 +2922,74 @@ def collect_status(scope: str, project_dir: Optional[str], name: str, runtime: b
                 "runtime_ready": runtime_status["runtime_ready"],
             }
             status["installed"] = bool(status["installed"] and runtime_status["runtime_ready"])
+            status["competing_context"] = collect_competing_context(paths, runtime_status)
     return status
+
+
+def _status_error_payload(args: Any, message: str) -> Dict[str, Any]:
+    """status --json fail-closed document. GUI treats ok:false as ContractError."""
+    return {
+        "schema": JSON_SCHEMA,
+        "operation": "status",
+        "ok": False,
+        "error": message,
+        "blockers": [message],
+        "scope": getattr(args, "scope", None),
+        "root": None,
+        "memory_file": None,
+        "instruction_file": None,
+        "import_target": None,
+        "memory_file_exists": False,
+        "instruction_file_exists": False,
+        "import_block_exists": False,
+        "agents_file": None,
+        "agents_file_exists": False,
+        "agents_block_exists": False,
+        "installed": False,
+        "presence": {
+            "memory_file": False,
+            "instruction_file": False,
+            "import_block": False,
+            "agents_file": False,
+        },
+        "alignment": {"import_block_present": False, "agents_block_present": False},
+        "source_identity": {
+            "kind": "missing",
+            "instruction_sha256": None,
+            "instruction_size_bytes": None,
+            "drift": None,
+            "agents_sha256": None,
+        },
+        "recovery_state": {
+            "journals": [],
+            "journal_count": 0,
+            "atomic_temp_files": [],
+            "atomic_temp_count": 0,
+            "conflicts": [],
+            "lock_present": False,
+            "lock_live": False,
+            "recovery_required": False,
+            "must_recover_before_writes": False,
+        },
+        "competing_context": {
+            "wrapper_parent_only": True,
+            "builtin_explore_plan_omit_claudemd": True,
+            "agents_carrier": False,
+            "extra_rules": [],
+            "project_memory_md": [],
+            "host_upgrade_required": None,
+        },
+    }
 
 
 def command_status(args) -> int:
     try:
         status = collect_status(args.scope, args.project_dir, args.name, runtime=bool(getattr(args, "runtime", False)))
-    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        print(f"[错误] {exc}")
+    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        if args.json:
+            print(json.dumps(_status_error_payload(args, str(exc)), ensure_ascii=False, indent=2))
+        else:
+            print(f"[错误] {exc}")
         return 1
 
     if args.json:
@@ -2614,6 +3003,8 @@ def command_status(args) -> int:
     print(f"memory file exists: {'yes' if status['memory_file_exists'] else 'no'}")
     print(f"instruction file: {'yes' if status['instruction_file_exists'] else 'no'}")
     print(f"import block: {'yes' if status['import_block_exists'] else 'no'}")
+    print(f"agents file: {'yes' if status['agents_file_exists'] else 'no'} ({status['agents_file']})")
+    print(f"agents block: {'yes' if status['agents_block_exists'] else 'no'}")
     if "runtime" in status:
         rt = status["runtime"]
         if not rt.get("supported"):
@@ -2650,16 +3041,23 @@ def command_uninstall(args) -> int:
         runtime = bool(getattr(args, "runtime", False))
         if runtime and paths.scope != "user":
             raise ValueError("--runtime 仅支持 --scope user")
+        agents = bool(getattr(args, "agents", False))
     except (FileNotFoundError, ValueError, UnicodeDecodeError) as exc:
         return _write_command_error(args, "uninstall", str(exc))
 
     instruction_path = paths.instruction_file(md_filename)
+    agents_path = paths.agents_file()
+    agents_existing = read_text_if_exists(agents_path) if agents_path.exists() else ""
+    agents_owned = bool(agents_existing) and keysmith_owns_agent_file(agents_existing)
+    remove_agents = bool(agents and agents_owned)
     report = _write_report_base("uninstall", args, paths, name)
     report["target"] = {
         "memory_file": str(paths.memory_file),
         "instruction_file": str(instruction_path),
         "import_target": paths.import_target(md_filename),
     }
+    if agents:
+        report["target"]["agents_file"] = str(agents_path)
 
     if not preview_header_mode(args):
         residue_blockers = _blockers_for_recovery_residue(paths)
@@ -2677,6 +3075,9 @@ def command_uninstall(args) -> int:
         print(f"remove import block: {'yes' if memory_changed else 'no'}")
         print(f"remove instruction file: {'yes' if instruction_path.exists() else 'no'}")
         print(f"runtime uninstall: {'yes' if runtime else 'no'}")
+        print(f"agents uninstall: {'yes' if agents else 'no'}")
+        if agents and agents_path.exists() and not agents_owned:
+            print(f"agents file left intact (not keysmith-owned): {agents_path}")
 
     if paths.memory_file.exists() and memory_changed:
         _add_action(report, "backup", paths.memory_file, "back up memory file before import block removal")
@@ -2686,6 +3087,13 @@ def command_uninstall(args) -> int:
     if instruction_path.exists():
         _add_action(report, "backup", instruction_path, "back up instruction file before removal")
         _add_action(report, "remove", instruction_path, "remove keysmith instruction file")
+    if remove_agents:
+        _add_action(report, "backup", agents_path, "back up keysmith agent file before removal")
+        _add_action(report, "remove", agents_path, "remove keysmith-owned agent file")
+    elif agents and agents_path.exists() and not agents_owned:
+        report["warnings"].append(
+            f"agents file left intact (not keysmith-owned): {agents_path}"
+        )
 
     rt = user_runtime_paths() if runtime else None
     shell_rc_updated = ""
@@ -2724,6 +3132,8 @@ def command_uninstall(args) -> int:
             _planned_backup(report, paths.memory_file)
         if instruction_path.exists():
             _planned_backup(report, instruction_path)
+        if remove_agents:
+            _planned_backup(report, agents_path)
         if runtime and rt is not None:
             for path in (rt["system_prompt"], rt["append_prompt"]):
                 if path.exists():
@@ -2769,6 +3179,14 @@ def command_uninstall(args) -> int:
             tx_remove_step(journal, instruction_path)
             if not use_json:
                 print(f"[移除] {instruction_path}")
+        if remove_agents:
+            backup = tx_backup_step(journal, agents_path, timestamp)
+            _actual_backup(report, agents_path, backup)
+            if not use_json:
+                print(f"[备份] {agents_path.name} → {backup.name}")
+            tx_remove_step(journal, agents_path)
+            if not use_json:
+                print(f"[移除] {agents_path}")
 
         if runtime and rt is not None:
             for path in (rt["system_prompt"], rt["append_prompt"]):
@@ -3306,8 +3724,23 @@ def command_runtime_doctor(args) -> int:
             "shell_rc": str(rt["shell_rc"]),
             "repair_actions": repair_actions,
         }
-    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        print(f"[错误] {exc}")
+    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        message = str(exc)
+        status = {
+            "installation_type": "unavailable",
+            "upstream_candidates": [],
+            "upstream_path": None,
+            "system_prompt_file": "",
+            "append_prompt_file": "",
+            "settings_file": "",
+            "shell_kind": runtime_shell_kind(),
+            "shell_rc": "",
+            "repair_actions": [message],
+        }
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(f"[错误] {message}")
         return 1
 
     if args.json:
@@ -3355,6 +3788,7 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s install --scope project --dry-run
   %(prog)s install --scope user --name team-rules --yes
   %(prog)s install --scope user --runtime --yes
+  %(prog)s install --scope project --agents --yes
   %(prog)s status --scope user --runtime --json
   %(prog)s doctor --json
   %(prog)s uninstall --scope user --runtime --yes
@@ -3381,6 +3815,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="user scope 额外注入 system-prompt.md + append-prompt.md + settings.systemPrompt + shell wrapper",
     )
     install.add_argument(
+        "--agents",
+        action="store_true",
+        help="额外写入 keysmith 拥有的 agents/keysmith.md，给 Task/自定义子 agent 用；不改用户其它 agent 文件",
+    )
+    install.add_argument(
         "--append-file",
         help="runtime append 指令文件；默认 examples/claude-append-prompt.md",
     )
@@ -3403,6 +3842,11 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall = subparsers.add_parser("uninstall", help="移除自己的 managed block，并备份后移除对应指令文件")
     add_scope_args(uninstall)
     uninstall.add_argument("--runtime", action="store_true", help="同时移除 runtime 文件与 shell wrapper（不自动清空 settings.systemPrompt）")
+    uninstall.add_argument(
+        "--agents",
+        action="store_true",
+        help="同时移除 keysmith 拥有的 agents/keysmith.md（不碰用户其它 agent 文件）",
+    )
     uninstall.add_argument("--dry-run", action="store_true", help="兼容参数；默认就是预览模式")
     uninstall.add_argument("--yes", action="store_true", help="确认写入；未提供时只预览")
     uninstall.add_argument("--json", action="store_true", help="输出稳定 JSON（claude-keysmith/v1）")

@@ -150,8 +150,11 @@ jobs:
           $installer = $installers[0]
 
           $guiVersion = (Get-Content gui/package.json -Raw | ConvertFrom-Json).version
+          $cliTag = (Select-String -Path claude-instruct.py -Pattern '^VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $cliTag) { throw 'VERSION not found in claude-instruct.py' }
+          $expectedCliVersion = "claude-keysmith $cliTag"
           $cliVersion = (& $sidecar --version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $cliVersion -ne 'claude-keysmith v7.1') { throw "sidecar --version smoke failed: $cliVersion" }
+          if ($LASTEXITCODE -ne 0 -or $cliVersion -ne $expectedCliVersion) { throw "sidecar --version smoke failed: $cliVersion (expected $expectedCliVersion)" }
 
           $installerSignature = (Get-AuthenticodeSignature -LiteralPath $installer.FullName).Status.ToString()
           if ($installerSignature -ne 'NotSigned') { throw "candidate must remain unsigned; installer signature is $installerSignature" }
@@ -171,8 +174,8 @@ jobs:
           }
 
           $installedCliVersion = (& $installedSidecar --version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $installedCliVersion -ne 'claude-keysmith v7.1') {
-            throw "installed sidecar smoke failed: $installedCliVersion"
+          if ($LASTEXITCODE -ne 0 -or $installedCliVersion -ne $expectedCliVersion) {
+            throw "installed sidecar smoke failed: $installedCliVersion (expected $expectedCliVersion)"
           }
           $sourceSidecarHash = (Get-FileHash -LiteralPath $sidecar -Algorithm SHA256).Hash.ToLowerInvariant()
           $installedSidecarHash = (Get-FileHash -LiteralPath $installedSidecar -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -320,6 +323,143 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "installed sidecar runtime uninstall failed: $runtimeUninstall" }
           if (-not (($runtimeUninstall | ConvertFrom-Json).ok)) { throw "installed sidecar uninstall contract is not ok" }
 
+          # Exercise close while a sidecar process tree is still active. Without
+          # the frontend process lease, Tauri drops only the direct child and
+          # this helper never reaches its completion marker.
+          $slowSmokeRoot = Join-Path $env:RUNNER_TEMP 'claude-keysmith-slow-sidecar'
+          New-Item -ItemType Directory -Force -Path $slowSmokeRoot | Out-Null
+          $slowSidecarSource = Join-Path $slowSmokeRoot 'slow-sidecar.rs'
+          $slowSidecarBinary = Join-Path $slowSmokeRoot 'slow-sidecar.exe'
+          $realSidecarBackup = Join-Path $slowSmokeRoot 'claude-keysmith-cli.real.exe'
+          $slowMarker = Join-Path $slowSmokeRoot 'slow-sidecar.marker'
+          # Bake the marker path into the fixture. Start-Process defaults to
+          # UseShellExecute on Windows, so a process-level environment variable
+          # never reaches the GUI or the sidecar it launches.
+          @'
+          use std::env;
+          use std::fs::OpenOptions;
+          use std::io::Write;
+          use std::process::Command;
+          use std::thread;
+          use std::time::Duration;
+
+          fn mark(value: &str) {
+              let marker = r#"__SLOW_MARKER_PATH__"#;
+              let mut file = OpenOptions::new()
+                  .create(true)
+                  .append(true)
+                  .open(marker)
+                  .expect("open marker");
+              writeln!(file, "{value}").expect("write marker");
+          }
+
+          fn main() {
+              if env::args().any(|arg| arg == "--slow-child") {
+                  thread::sleep(Duration::from_secs(6));
+                  mark("child-complete");
+                  return;
+              }
+
+              let executable = env::current_exe().expect("current executable");
+              let mut child = Command::new(executable)
+                  .arg("--slow-child")
+                  .spawn()
+                  .expect("spawn child");
+              mark("started");
+              assert!(child.wait().expect("wait for child").success());
+              mark("complete");
+              println!("claude-keysmith v7.2");
+          }
+          '@.Replace('__SLOW_MARKER_PATH__', $slowMarker) | Set-Content -LiteralPath $slowSidecarSource -Encoding UTF8
+          & rustc $slowSidecarSource -O -o $slowSidecarBinary
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $slowSidecarBinary)) {
+            throw "Failed to build the slow sidecar lifecycle fixture."
+          }
+          $sidecarIdleDeadline = [DateTime]::UtcNow.AddSeconds(15)
+          do {
+            $busySidecars = @(
+              Get-Process -Name "claude-keysmith*" -ErrorAction SilentlyContinue |
+                Where-Object {
+                  try { $_.Path.Equals($installedSidecar, [StringComparison]::OrdinalIgnoreCase) }
+                  catch { $false }
+                }
+            )
+            if ($busySidecars.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 250
+          } while ([DateTime]::UtcNow -lt $sidecarIdleDeadline)
+          if ($busySidecars.Count -ne 0) {
+            throw "Installed sidecar remained busy before the slow-sidecar fixture swap."
+          }
+          Copy-Item -LiteralPath $installedSidecar -Destination $realSidecarBackup
+          $slowAppProcess = $null
+          try {
+            Copy-Item -LiteralPath $slowSidecarBinary -Destination $installedSidecar -Force
+            $slowAppProcess = Start-Process -FilePath $installedGui -WorkingDirectory $installDir -PassThru
+            $slowWindowDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              Start-Sleep -Milliseconds 250
+              $slowAppProcess.Refresh()
+            } while (
+              -not $slowAppProcess.HasExited -and
+              $slowAppProcess.MainWindowHandle -eq 0 -and
+              [DateTime]::UtcNow -lt $slowWindowDeadline
+            )
+            if ($slowAppProcess.HasExited -or $slowAppProcess.MainWindowHandle -eq 0) {
+              throw "Slow-sidecar GUI did not expose its main window."
+            }
+            $slowMarkerDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              $slowMarkerText = if (Test-Path -LiteralPath $slowMarker) {
+                Get-Content -LiteralPath $slowMarker -Raw
+              }
+              else {
+                ""
+              }
+              if ($slowMarkerText -match "(?m)^started\r?$") { break }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $slowMarkerDeadline)
+            if ($slowMarkerText -notmatch "(?m)^started\r?$") {
+              throw "Slow sidecar did not start within 30 seconds."
+            }
+            Start-Sleep -Seconds 1
+            if (-not $slowAppProcess.CloseMainWindow()) {
+              throw "Slow-sidecar GUI rejected the native close request."
+            }
+            if (-not $slowAppProcess.WaitForExit(20000)) {
+              throw "Slow-sidecar GUI did not exit after the active process tree completed."
+            }
+            $slowMarkerText = Get-Content -LiteralPath $slowMarker -Raw
+            if (
+              $slowMarkerText -notmatch "(?m)^child-complete\r?$" -or
+              $slowMarkerText -notmatch "(?m)^complete\r?$"
+            ) {
+              throw "GUI closed before the active sidecar process tree completed."
+            }
+          }
+          finally {
+            if ($null -ne $slowAppProcess) {
+              $slowAppProcess.Refresh()
+              if (-not $slowAppProcess.HasExited) {
+                Stop-Process -Id $slowAppProcess.Id -Force -ErrorAction SilentlyContinue
+                $slowAppProcess.WaitForExit(5000) | Out-Null
+              }
+            }
+            $slowSidecarProcesses = @(
+              Get-Process -Name "claude-keysmith*" -ErrorAction SilentlyContinue |
+                Where-Object {
+                  try { $_.Path.Equals($installedSidecar, [StringComparison]::OrdinalIgnoreCase) }
+                  catch { $false }
+                }
+            )
+            foreach ($process in $slowSidecarProcesses) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              try { $process.WaitForExit(5000) | Out-Null }
+              catch {}
+            }
+            Copy-Item -LiteralPath $realSidecarBackup -Destination $installedSidecar -Force
+            Remove-Item -LiteralPath $slowSmokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           # Hosted runners cannot judge visual layout, but they can prove the
           # installed WebView process starts and the single-instance guard holds.
           $firstGui = Start-Process -FilePath $installedGui -WorkingDirectory $installDir -PassThru
@@ -357,7 +497,7 @@ jobs:
 
           $installerAsset = Join-Path $stage "claude-keysmith-desktop-$guiVersion-windows-x64-unsigned-setup.exe"
           Copy-Item -LiteralPath $installer.FullName -Destination $installerAsset
-          $sidecarArchive = Join-Path $stage 'claude-keysmith-cli-v7.1-windows-x64-unsigned.zip'
+          $sidecarArchive = Join-Path $stage "claude-keysmith-cli-$cliTag-windows-x64-unsigned.zip"
           Compress-Archive -LiteralPath $sidecar -DestinationPath $sidecarArchive
 
           $files = @(Get-ChildItem -LiteralPath $stage -File | Sort-Object Name)
@@ -393,6 +533,7 @@ jobs:
             privacy_smoke = $true
             gui_process_smoke = $true
             single_instance_smoke = $true
+            close_while_sidecar_smoke = $true
             source_sidecar_sha256 = $sourceSidecarHash
             embedded_sidecar_sha256 = $installedSidecarHash
             channel        = 'beta'
@@ -493,8 +634,11 @@ jobs:
           hdiutil verify "$dmg"
 
           gui_version="$(node -p "require('./gui/package.json').version")"
+          cli_tag="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' claude-instruct.py | head -n 1)"
+          [ -n "$cli_tag" ] || { echo "VERSION not found in claude-instruct.py" >&2; exit 1; }
+          expected_cli_version="claude-keysmith $cli_tag"
           cli_version="$("$sidecar" --version)"
-          [ "$cli_version" = "claude-keysmith v7.1" ] || { echo "sidecar version mismatch: $cli_version" >&2; exit 1; }
+          [ "$cli_version" = "$expected_cli_version" ] || { echo "sidecar version mismatch: $cli_version (expected $expected_cli_version)" >&2; exit 1; }
           codesign --verify --strict --verbose=4 "$sidecar"
           source_signature_info="$(codesign -dvvv "$sidecar" 2>&1)"
           printf '%s\n' "$source_signature_info" | grep -q '^Signature=adhoc$'
@@ -528,7 +672,7 @@ jobs:
           [ "$gui_arch" = "arm64" ] || { echo "GUI architecture mismatch: $gui_arch" >&2; exit 1; }
           [ "$embedded_arch" = "arm64" ] || { echo "embedded sidecar architecture mismatch: $embedded_arch" >&2; exit 1; }
           embedded_cli_version="$("$embedded_sidecar" --version)"
-          [ "$embedded_cli_version" = "claude-keysmith v7.1" ] || { echo "embedded sidecar version mismatch: $embedded_cli_version" >&2; exit 1; }
+          [ "$embedded_cli_version" = "$expected_cli_version" ] || { echo "embedded sidecar version mismatch: $embedded_cli_version (expected $expected_cli_version)" >&2; exit 1; }
           codesign --verify --strict --verbose=4 "$embedded_sidecar"
           embedded_signature_info="$(codesign -dvvv "$embedded_sidecar" 2>&1)"
           printf '%s\n' "$embedded_signature_info" | grep -q '^Signature=adhoc$'
@@ -567,13 +711,14 @@ jobs:
 
           dmg_asset="$stage/claude-keysmith-desktop-${gui_version}-macos-arm64-unsigned.dmg"
           cp "$dmg" "$dmg_asset"
-          sidecar_archive="$stage/claude-keysmith-cli-v7.1-macos-arm64-adhoc.tar.gz"
+          sidecar_archive="$stage/claude-keysmith-cli-${cli_tag}-macos-arm64-adhoc.tar.gz"
           tar -czf "$sidecar_archive" -C "$(dirname "$sidecar")" "$(basename "$sidecar")"
           tar -tzf "$sidecar_archive" | grep -qx 'claude-keysmith-cli-aarch64-apple-darwin'
 
           export STAGE_DIR="$stage"
           export GUI_VERSION="$gui_version"
           export CLI_VERSION="$cli_version"
+          export CLI_TAG="$cli_tag"
           export SOURCE_COMMIT="$source_commit"
           export GUI_ARCH="$gui_arch"
           export SOURCE_SIDECAR_SHA256="$source_sidecar_sha256"
@@ -592,7 +737,7 @@ jobs:
           artifact_paths = sorted(
               [
                   next(stage.glob("*.dmg")),
-                  stage / "claude-keysmith-cli-v7.1-macos-arm64-adhoc.tar.gz",
+                  stage / f"claude-keysmith-cli-{os.environ['CLI_TAG']}-macos-arm64-adhoc.tar.gz",
               ],
               key=lambda path: path.name,
           )

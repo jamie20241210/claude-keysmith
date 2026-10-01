@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- `status --json` 增加 `competing_context`：wrapper 只绑父进程、Explore/Plan `omitClaudeMd`、`--agents` 载体是否在、`.claude/rules` 额外稿、`MEMORY.md`、以及 `--runtime` 时的 `host_upgrade_required`。`doctor --json` 仍是固定 9 键。
+- `docs/series-eval.md` 与 `breaktest/series-bank.txt`：四套 Keysmith 共用 cell ID。
+- `install --agents` / `uninstall --agents`：写入或移除 keysmith 拥有的 `agents/keysmith.md`（user：`~/.claude/agents/`，project/local：`<repo>/.claude/agents/`），给 Task / 自定义子 agent 用。只动带标记的自己那份文件，失败关闭拒绝覆盖用户原文。默认 install 行为不变。
+- `status --json` 增加 `agents_file` / `agents_file_exists` / `agents_block_exists` 与 `presence.agents_file`、`alignment.agents_block_present`。`doctor --json` 仍是固定 9 键。
+- README 插图换成系列暖金钥匙静物（hero、使用方式、dry-run 预览、1/4 → 3/4 效果图）。
+- README 改成产品说明首页（hero、使用方式、效果三张图）。默认项目规则同步更新。
+
+## Desktop 0.1.0-beta.3 (Pre-release)
+
+- GUI `0.1.0-beta.2` → `0.1.0-beta.3`；打包 sidecar 升到 CLI `v7.2`。业务调用仍只吃 `claude-keysmith/v1` JSON。
+- 移植 Codex #80 超时语义：`child.wait()` 成功后，管道 join 仍受同一 deadline 约束；leader 已退出但管道被子孙占住时，对 wait 之前保存的 pid 进程组发 SIGKILL 并返回 `timed_out`。保留 pipe-None fail-closed 与 Windows `taskkill` 测试；补 `timeout_covers_pipes_after_leader_exit`。
+- `gui-release-candidate` Windows 候选补 close-while-sidecar 烟测（sidecar 进程树仍活动时的关闭屏障）。不改 doctor / backups / restore / recentProjects / exclusive-vs-shared lease。
+- Windows Desktop / sidecar 在没有用户级 `PSModulePath`（资源管理器启动的 GUI 进程常见）时，不再把 runtime 探测直接失败关闭。改为：仍优先使用 `PSModulePath` 里第一个可识别的用户 Modules 条目；没有时回退到用户 Documents 下已存在的 PowerShell profile，否则写入 Win10 默认的 `Documents\\WindowsPowerShell\\Microsoft.PowerShell_profile.ps1`。Known Folder / 注册表只在 *home* 就是当前 Windows 用户配置目录时启用，避免 `CLAUDE_KEYSMITH_HOME` 或测试夹具写到 runner 自己的 Documents。`CLAUDE_KEYSMITH_SHELL_RC` 仍然覆盖。
+- `status --json` / `doctor --json` 在 runtime 探测或 project-dir 校验失败时仍输出契约 JSON，GUI 不再把 stdout 里的 `[错误]` 文本显示成「状态加载失败 / CLI 未输出稳定 JSON」。
+- `gui-release-candidate` 的 sidecar `--version` 断言改为读取 `claude-instruct.py` 的 `VERSION`，不再写死 `v7.1`。
+
+## v7.2 (2026-09-10)
+
+- Bundled project-rules rewritten as a short lab/CTF/pentest project face; creative delivery stays in append only. Authorization-term recast removed after Opus 5 read it as a refusal-override.
+- README rework (zh/en): diagram-rich user face, technical detail sunk to `docs/reference.md`; deploy-flow and Fable wrapper dual-use trend SVGs (light/dark). Agent-install templates pin the current prompt SHA-256.
+- CLI version string `v7.1` → `v7.2`. No Desktop update.
+
 ## v7.1 (2026-08-17)
 
 - 重新整理新人安装路径，明确稳定版、预发布版与未签名 Desktop Beta 的区别。

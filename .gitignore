@@ -7,5 +7,6 @@ htmlcov/
 .venv/
 .venv-build/
 .env
+tools/.readme-render/
 
 .idea

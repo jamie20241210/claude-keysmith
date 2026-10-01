@@ -12,7 +12,8 @@
   - `ok: false` ⇒ 调用方必须视为失败并停止后续动作，即使 exit code 为 0 的场景也不存在——非零 exit 与 `ok:false` 同时成立。
   - 未捕获异常同样以 `ok: false` + `error` 输出 JSON（不丢 Python traceback 给调用方）。
   - **参数校验失败**（如 `--max-tokens 0`）在传入 `--json` 时也输出契约 JSON 到 stdout（`ok: false`、`exit_status: 2`，`error` / `blockers` 为 argparse 的具体原因），argparse 的 usage 文本仍保留在 stderr 供人工阅读；进程退出码为 2。
-  - GUI 侧的 proceed 判定见 `gui/src/lib/parser.js` 的 `gateReport`：`exit_code !== 0`、`blockers` 非空、`ok === false` 任一成立即 blocked。
+  - **`status --json` / `doctor --json` 探测失败**同样输出 JSON，不向 stdout 打印 `[错误]` 文本。`status` 在 project-dir 不存在等校验失败时给出 `ok: false` 的 status 文档；user-scope `--runtime` 的 profile/runtime 探测失败则仍返回 status 骨架，并把原因放进 `runtime.error` / `runtime_readiness.runtime_ready: false`。`doctor` 保持固定 9 键，把原因放进 `repair_actions`。
+  - GUI 侧的 proceed 判定见 `gui/src/lib/parser.js` 的 `gateReport`：`exit_code !== 0`、`blockers` 非空、`ok === false` 任一成立即 blocked。`parseStatusReport` 对 `ok: false` 抛出带 `error` 原文的 `ContractError`。
 - **凭证脱敏**：契约与文本输出都不包含 API token、cookie、Base URL 或非目标的 `settings.json` 字段值。`settings.json` 仅以路径（`settings_file`）和布尔对齐状态（`settings_system_prompt_aligned`）出现；`doctor` 更是固定 9 个键，永不扩展出凭证字段。
 - **sha256 / size_bytes**：`backups[]`、`source`/`sources`、`status.source_identity` 中的指纹均为 SHA-256 十六进制 + 字节数，供调用方核验内容，不展示内容本身。
 
@@ -56,7 +57,7 @@
 
 ## `install --json`
 
-target 在 runtime 安装时扩展为包含 `system_prompt_file`、`append_prompt_file`、`settings_file`、`shell_rc`、`shell_kind`、`upstream_path`、`upstream_exists`。
+target 在 runtime 安装时扩展为包含 `system_prompt_file`、`append_prompt_file`、`settings_file`、`shell_rc`、`shell_kind`、`upstream_path`、`upstream_exists`。`--agents` 时增加 `agents_file`。
 
 执行示例（已脱敏：临时 HOME 替换为 `~`，上游入口路径替换为占位符）：
 
@@ -214,14 +215,15 @@ target 在 runtime 安装时扩展为包含 `system_prompt_file`、`append_promp
 
 | 块 | 字段 |
 |---|---|
-| `presence` | `memory_file`、`instruction_file`、`import_block`、`system_prompt`、`append_prompt`、`settings_file`、`shell_wrapper`（后四项仅 `--runtime` 时填充） |
-| `alignment` | `import_block_present`、`import_target`、`settings_system_prompt_aligned`、`shell_wrapper_current`、`shell_wrapper_managed` |
-| `source_identity` | `kind`（`deployed`/`missing`）、`instruction_sha256`、`instruction_size_bytes`、`drift`、`system_prompt_sha256`、`settings_system_prompt_drift` |
+| `presence` | `memory_file`、`instruction_file`、`import_block`、`agents_file`、`system_prompt`、`append_prompt`、`settings_file`、`shell_wrapper`（后四项仅 `--runtime` 时填充） |
+| `alignment` | `import_block_present`、`import_target`、`agents_block_present`、`settings_system_prompt_aligned`、`shell_wrapper_current`、`shell_wrapper_managed` |
+| `source_identity` | `kind`（`deployed`/`missing`）、`instruction_sha256`、`instruction_size_bytes`、`drift`、`agents_sha256`、`system_prompt_sha256`、`settings_system_prompt_drift` |
 | `runtime_readiness` | `upstream_candidates`、`upstream_path`、`upstream_exists`、`shell_wrapper_current`、`upgrade_required`、`legacy_launcher_detected`、`legacy_launcher_paths`、`legacy_launcher_conflict`、`legacy_launcher_conflict_paths`、`runtime_ready`（仅 user scope `--runtime`） |
 | `recovery_state` | `journals`、`journal_count`、`atomic_temp_files`、`atomic_temp_count`、`conflicts`、`lock_present`、`lock_live`、`recovery_required`、`must_recover_before_writes` |
+| `competing_context` | `wrapper_parent_only`、`builtin_explore_plan_omit_claudemd`、`agents_carrier`、`extra_rules`、`project_memory_md`、`host_upgrade_required`（仅 `--runtime` 时填入；Explore/Plan 走 `omitClaudeMd`，主会话 wrapper 管不到子 agent） |
 | `runtime` | 完整 runtime 状态（仅 user scope `--runtime`；非 user scope 为 `{supported: false, reason: ...}`） |
 
-`recovery_state.journals[]` 条目：`{journal_path, journal_id, operation, state, started_at, pid}`。`runtime_ready` 只有在 prompt 文件完整、settings 对齐、wrapper 为当前 v7.1 模板、上游入口存在且无旧 launcher 冲突时才为 `true`。
+`recovery_state.journals[]` 条目：`{journal_path, journal_id, operation, state, started_at, pid}`。`runtime_ready` 只有在 prompt 文件完整、settings 对齐、wrapper 为当前 v7.2 模板、上游入口存在且无旧 launcher 冲突时才为 `true`。user-scope `--runtime` 的 profile 探测失败时 `runtime.error` 为原因字符串，`runtime_readiness.runtime_ready` 为 `false`，其余 presence / recovery 块仍可用。project-dir 不存在时整个 status 文档为 `ok: false`。
 
 示例（未安装，user scope + `--runtime`，截选）：
 
@@ -236,10 +238,13 @@ target 在 runtime 安装时扩展为包含 `system_prompt_file`、`append_promp
   "memory_file_exists": false,
   "instruction_file_exists": false,
   "import_block_exists": false,
+  "agents_file": "~/.claude/agents/keysmith.md",
+  "agents_file_exists": false,
+  "agents_block_exists": false,
   "installed": false,
-  "presence": {"memory_file": false, "instruction_file": false, "import_block": false, "system_prompt": false, "append_prompt": false, "settings_file": false, "shell_wrapper": false},
-  "alignment": {"import_block_present": false, "import_target": "@keysmith/claude-project-rules.md", "settings_system_prompt_aligned": false, "shell_wrapper_current": false, "shell_wrapper_managed": false},
-  "source_identity": {"kind": "missing", "instruction_sha256": null, "instruction_size_bytes": null, "drift": null, "system_prompt_sha256": null, "settings_system_prompt_drift": null},
+  "presence": {"memory_file": false, "instruction_file": false, "import_block": false, "agents_file": false, "system_prompt": false, "append_prompt": false, "settings_file": false, "shell_wrapper": false},
+  "alignment": {"import_block_present": false, "import_target": "@keysmith/claude-project-rules.md", "agents_block_present": false, "settings_system_prompt_aligned": false, "shell_wrapper_current": false, "shell_wrapper_managed": false},
+  "source_identity": {"kind": "missing", "instruction_sha256": null, "instruction_size_bytes": null, "drift": null, "agents_sha256": null, "system_prompt_sha256": null, "settings_system_prompt_drift": null},
   "recovery_state": {"journals": [], "journal_count": 0, "atomic_temp_files": [], "atomic_temp_count": 0, "conflicts": [], "lock_present": false, "lock_live": false, "recovery_required": false, "must_recover_before_writes": false},
   "runtime_readiness": {"upstream_candidates": [], "upstream_path": null, "upstream_exists": false, "shell_wrapper_current": false, "upgrade_required": true, "legacy_launcher_detected": false, "legacy_launcher_paths": [], "legacy_launcher_conflict": false, "legacy_launcher_conflict_paths": [], "runtime_ready": false}
 }
@@ -247,7 +252,7 @@ target 在 runtime 安装时扩展为包含 `system_prompt_file`、`append_promp
 
 ## `backups --json`
 
-只读。只枚举 keysmith 创建的、能通过 `^(?P<target>.+)\.bak_(?P<ts>\d{8}_\d{6})(?:_(?P<rest>.*))?$` 校验的备份文件，不会把任意文件当备份。扫描位置：scope 根目录（`kind: "memory"`）、keysmith 目录（`kind: "instruction"`）；user scope 额外包含 runtime keysmith 目录（`kind: "runtime"`）、shell profile 所在目录（`kind: "shell_rc"`）与 `~/.local/bin`（`kind: "legacy_launcher"`）。
+只读。只枚举 keysmith 创建的、能通过 `^(?P<target>.+)\.bak_(?P<ts>\d{8}_\d{6})(?:_(?P<rest>.*))?$` 校验的备份文件，不会把任意文件当备份。扫描位置：scope 根目录（`kind: "memory"`）、keysmith 目录（`kind: "instruction"`）、agents 目录（`kind: "agents"`）；user scope 额外包含 runtime keysmith 目录（`kind: "runtime"`）、shell profile 所在目录（`kind: "shell_rc"`）与 `~/.local/bin`（`kind: "legacy_launcher"`）。
 
 | 字段 | 说明 |
 |---|---|
