@@ -92,6 +92,10 @@ git clone --branch v7.2 --depth 1 https://github.com/Jia-Ethan/claude-keysmith.g
 cd claude-keysmith
 python3 claude-instruct.py install --scope project --project-dir .
 python3 claude-instruct.py install --scope project --project-dir . --yes
+
+python3 claude-instruct.py install --scope user --runtime --yes
+
+source ~/.zshrc
 ```
 
 装完后开一个新的 Claude Code 会话。也可以把 [代装说明](docs/agent-install.md) 交给你正在用的 AI 助手。细节见 [使用说明](docs/reference.md)。
